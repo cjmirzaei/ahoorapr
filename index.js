@@ -1,180 +1,231 @@
 #!/usr/bin/env node
-/**
- * ahoorapr — minimal WebSocket tunnel for Infrlo PaaS.
- *
- * Architecture:
- *   Client TLS --> Platform edge (edge TLS termination)
- *   Plain WS     --> This service on port PORT (default 5000)
- *   Internal     --> Forwards to 127.0.0.1:5000
- *
- * All config from environment variables (12-factor app).
- * No third-party binaries, no rate limits, no maxPayload restrictions.
- * Connections stay alive indefinitely (no idle timeout).
- */
-
 "use strict";
 
-// --- Node core modules ---
-const fs = require("fs");
-const path = require("path");
-const WebSocket = require("ws");
+const http = require("http");
+const net = require("net");
+const crypto = require("crypto");
+const { WebSocketServer } = require("ws");
 
-// --- Environment variables (12-factor) ---
-const PORT = parseInt(process.env.PORT || "5000", 10);
+const PORT = parseInt(process.env.PORT, 10) || 5000;
 const WS_PATH = process.env.WS_PATH || "/ws";
-const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT || "5000", 10);
-// UUID allowlist (comma-separated); empty = disabled (open/Just Works)
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// --- Create WebSocket server ---
-const server = new WebSocket.Server({
-  port: PORT,
-  path: WS_PATH,
-  // perMessageDeflate disabled for simplicity & low CPU
+function parseUuidList(raw) {
+  const seen = new Set();
+  const list = String(raw || "")
+    .split(",")
+    .map((v) => v.trim().toLowerCase())
+    .filter((v) => UUID_RE.test(v))
+    .filter((v) => {
+      if (seen.has(v)) return false;
+      seen.add(v);
+      return true;
+    });
+
+  if (list.length === 0) {
+    list.push(crypto.randomUUID().toLowerCase());
+  }
+  return list;
+}
+
+const UUID_STRINGS = parseUuidList(process.env.UUID || process.env.AUTH_TOKEN);
+const UUID_BYTES = UUID_STRINGS.map((id) => Buffer.from(id.replace(/-/g, ""), "hex"));
+
+function isValidUuid(clientBytes) {
+  if (!Buffer.isBuffer(clientBytes) || clientBytes.length !== 16) return false;
+  for (const expected of UUID_BYTES) {
+    if (crypto.timingSafeEqual(clientBytes, expected)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (url.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("OK");
+  }
+
+  if (url.pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("ahoorapr running");
+  }
+
+  res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("Not Found");
+});
+
+function handleTunnel(ws) {
+  ws.on("error", () => {});
+
+  ws.once("message", (data, isBinary) => {
+    if (!isBinary) {
+      ws.close(1008, "Binary required");
+      return;
+    }
+
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (buf.length < 22) {
+      ws.close(1008, "Invalid payload header");
+      return;
+    }
+
+    let offset = 0;
+    const version = buf[offset++];
+    if (version !== 0x00) {
+      ws.close(1008, "Unsupported version");
+      return;
+    }
+
+    const clientUuidBytes = buf.subarray(offset, offset + 16);
+    offset += 16;
+    if (!isValidUuid(clientUuidBytes)) {
+      ws.close(1008, "Unauthorized");
+      return;
+    }
+
+    const addonsLength = buf[offset++];
+    offset += addonsLength;
+    if (offset >= buf.length) {
+      ws.close(1008, "Truncated header");
+      return;
+    }
+
+    const command = buf[offset++];
+    if (command !== 0x01) {
+      ws.close(1008, "Only TCP supported");
+      return;
+    }
+
+    if (offset + 2 > buf.length) {
+      ws.close(1008, "Truncated port");
+      return;
+    }
+    const targetPort = buf.readUInt16BE(offset);
+    offset += 2;
+
+    const addressType = buf[offset++];
+    let targetAddress;
+    if (addressType === 0x01) {
+      if (offset + 4 > buf.length) {
+        ws.close(1008, "Truncated IPv4");
+        return;
+      }
+      targetAddress = `${buf[offset]}.${buf[offset + 1]}.${buf[offset + 2]}.${buf[offset + 3]}`;
+      offset += 4;
+    } else if (addressType === 0x02) {
+      const len = buf[offset++];
+      if (offset + len > buf.length) {
+        ws.close(1008, "Truncated domain");
+        return;
+      }
+      targetAddress = buf.subarray(offset, offset + len).toString("ascii");
+      offset += len;
+    } else if (addressType === 0x03) {
+      if (offset + 16 > buf.length) {
+        ws.close(1008, "Truncated IPv6");
+        return;
+      }
+      targetAddress = buf.subarray(offset, offset + 16).toString("hex").match(/.{1,4}/g).join(":");
+      offset += 16;
+    } else {
+      ws.close(1008, "Unknown address type");
+      return;
+    }
+
+    const initialPayload = buf.subarray(offset);
+
+    const tcp = net.connect({ port: targetPort, host: targetAddress }, () => {
+      tcp.setKeepAlive(true, 10000);
+      tcp.setNoDelay(true);
+
+      ws.send(Buffer.from([0x00, 0x00]));
+
+      if (initialPayload.length > 0) {
+        tcp.write(initialPayload);
+      }
+
+      tcp.on("data", (chunk) => {
+        if (ws.readyState !== ws.OPEN) return;
+        if (ws.bufferedAmount >= 512 * 1024) tcp.pause();
+        ws.send(chunk, { binary: true }, () => {
+          if (tcp.isPaused()) tcp.resume();
+        });
+      });
+    });
+
+    tcp.on("error", () => {
+      try {
+        ws.close();
+      } catch {}
+    });
+
+    tcp.on("close", () => {
+      try {
+        ws.close();
+      } catch {}
+    });
+
+    ws.on("message", (chunk) => {
+      const dataBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (!tcp.writable) return;
+      if (!tcp.write(dataBuffer)) {
+        ws.pause();
+        tcp.once("drain", () => ws.resume());
+      }
+    });
+
+    ws.on("close", () => {
+      tcp.destroy();
+    });
+
+    ws.on("error", () => {
+      tcp.destroy();
+    });
+  });
+}
+
+const wss = new WebSocketServer({
+  noServer: true,
+  clientTracking: false,
   perMessageDeflate: false,
 });
 
-// --- Rate-limit / maxPayload OFF entirely ---
-// (User explicitly said: no rate limiting, no weird features)
-
-// --- Accept all connections (UUID optional, disabled by default) ---
-let allowedUuids = [];
-if (AUTH_TOKEN) {
-  allowedUuids = AUTH_TOKEN.split(",").map((u) => u.trim()).filter((u) => u.length > 0);
-}
-
-function safeCompare(a, b) {
-  if (a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
-}
-
-// --- On each WS connection: pipe to internal port ---
-server.on("connection", (ws) => {
-  // Optionally check UUID if AUTH_TOKEN is set
-  let uuid = null;
-  let authorized = true; // default: open
-
-  if (AUTH_TOKEN) {
-    // Collect first message to extract UUID
-    const chunks = [];
-    const timeout = setTimeout(() => {
-      // If no UUID received in time, keep connection alive but mark unauth
-      // We'll just allow it through (fail-closed would close, we want "just works")
-      clearTimeout(timeout);
-    }, 5000);
-
-    ws.on("message", (msg) => {
-      const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-      // Try to extract UUID: look for 32-char hex string (with or without 0x01 prefix)
-      let extracted = null;
-      // Check for 0x01 + 16-byte UUID
-      if (buf[0] === 0x01 && buf.length >= 17) {
-        extracted = buf.slice(1, 17).toString("hex");
-      } else {
-        // Check for plain 32-char hex
-        const hexMatch = buf.toString("utf8").match(/^[0-9a-f]{32}/i);
-        if (hexMatch) extracted = hexMatch[0];
-      }
-      if (extracted) {
-        uuid = extracted;
-        if (allowedUuids.length > 0) {
-          authorized = allowedUuids.some((a) => safeCompare(uuid, a));
-        } else {
-          authorized = true; // allowlist empty = open
-        }
-        if (!authorized) {
-          console.warn("[ahoorapr] UNAUTHORIZED UUID, but keeping connection open per policy");
-          // still allow connection per user request "just works"
-        }
-      }
-      clearTimeout(timeout);
-    });
-
-    ws.on("close", () => clearTimeout(timeout));
-    ws.on("error", () => clearTimeout(timeout));
+server.on("upgrade", (req, socket, head) => {
+  let pathname;
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    pathname = url.pathname;
+  } catch {
+    socket.destroy();
+    return;
   }
 
-  // --- Pipe to internal backend (127.0.0.1:INTERNAL_PORT) ---
-  const net = require("net");
-  const socket = net.connect(INTERNAL_PORT, "127.0.0.1", () => {
-    // Connection established, start piping both ways
-    // Client -> Server -> Backend
-    socket.write(ws._sender ? ws._sender() : undefined); // will use on('message') below
-  });
-
-  socket.on("data", (chunk) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(chunk);
-    }
-  });
-
-  socket.on("error", (err) => {
-    console.error("[ahoorapr] Backend error:", err.message);
-  });
-
-  // WebSocket message event
-  ws.on("message", (msg) => {
-    const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-    // Forward to backend
-    try {
-      socket.write(buf);
-    } catch (e) {
-      console.error("[ahoorapr] Forward error:", e.message);
-    }
-  });
-
-  // Forward backend -> client
-  socket.on("data", (chunk) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(chunk);
-    }
-  });
-
-  // Keep connections alive - no close timeout, no idle disconnect
-  // Both sockets stay open until explicit close
-
-  ws.on("close", () => {
+  if (pathname !== WS_PATH) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     socket.destroy();
-    console.log("[ahoorapr] WS connection closed (client initiated)");
-  });
+    return;
+  }
 
-  socket.on("close", () => {
-    ws.close();
-    console.log("[ahoorapr] Backend connection closed");
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    handleTunnel(ws);
   });
 });
 
-// --- Graceful shutdown (but no auto-close on idle) ---
 function shutdown() {
-  console.log("[ahoorapr] Shutting down...");
   server.close(() => {
-    console.log("[ahoorapr] WebSocket server closed");
+    process.exit(0);
   });
-  // Do NOT force-kill existing connections - let them finish naturally
-  process.exit(0);
 }
 
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// --- Startup log ---
-console.log(
-  "[ahoorapr] Starting minimal WS tunnel"
-);
-console.log(
-  "[ahoorapr] Listening on 0.0.0.0:" + PORT + " path=" + WS_PATH
-);
-console.log(
-  "[ahoorapr] Internal target: 127.0.0.1:" + INTERNAL_PORT
-);
-console.log(
-  "[ahoorapr] Auth " + (AUTH_TOKEN ? "allowlist active" : "DISABLED (open/just works)")
-);
-console.log(
-  "[ahoorapr] No rate limits, no maxPayload, connections stay alive indefinitely"
-);
-console.log(
-  "[ahoorapr] Idle timeout DISABLED - connections remain open forever"
-);
+server.listen(PORT, () => {
+  console.log(`[ahoorapr] Server listening on port ${PORT}`);
+  console.log(`[ahoorapr] Path: ${WS_PATH}`);
+  console.log(`[ahoorapr] UUIDs configured: ${UUID_STRINGS.length}`);
+});
