@@ -4,11 +4,10 @@ import base64
 import hashlib
 import json
 import os
-import re
 import socket
 import struct
-import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 PORT = int(os.environ.get("PORT", "5000"))
@@ -20,8 +19,13 @@ UUID_STR = os.environ.get("UUID") or os.environ.get("AUTH_TOKEN") or "d342d11e-d
 UUID_STR = UUID_STR.strip().lower()
 UUID_BYTES = bytes.fromhex(UUID_STR.replace("-", ""))
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
 SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "newdogh.infrlo.com").strip()
-ENABLE_ARGO = os.environ.get("ENABLE_ARGO", "true").lower() in ("true", "1", "yes")
+PROJECT_URL = os.environ.get("PROJECT_URL", f"https://{SERVER_DOMAIN}").strip()
+AUTO_ACCESS = os.environ.get("AUTO_ACCESS", "true").lower() in ("true", "1", "yes")
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
 def log(*args):
     print("[ahoorapr]", *args, flush=True)
@@ -213,66 +217,59 @@ async def handle_client(reader, writer):
         except Exception:
             pass
 
-def print_connection_details(argo_domain=None):
+def print_server_summary():
     log("=" * 60)
-    log("SERVER READY - MULTI-ENDPOINT ACTIVE")
+    log("AHOORAPR SERVICE ACTIVE")
     log("=" * 60)
-    log(f"1) Direct Infrlo Domain (High Speed / Direct Infrlo Edge):")
-    log(f"   Address: {SERVER_DOMAIN}")
-    log(f"   Port: 443")
-    log(f"   Path: {WS_PATH}")
-    log(f"   UUID: {UUID_STR}")
-    log(f"   TLS: ON (SNI: {SERVER_DOMAIN})")
-    log("-" * 60)
-    if argo_domain:
-        log(f"2) Argo Quick Tunnel (Fallback):")
-        log(f"   Address: {argo_domain}")
-        log(f"   Port: 443")
-        log(f"   Path: {WS_PATH}")
-        log(f"   UUID: {UUID_STR}")
-        log(f"   TLS: ON (SNI: {argo_domain})")
+    log(f"Domain : {SERVER_DOMAIN}")
+    log(f"Port   : 443 (Internal forward -> {PORT})")
+    log(f"Path   : {WS_PATH}")
+    log(f"UUID   : {UUID_STR}")
+    log(f"TLS    : Enabled (SNI: {SERVER_DOMAIN})")
+    log(f"Ping   : {PROJECT_URL}/health (Interval: 240s)")
     log("=" * 60)
 
-async def start_argo_tunnel():
-    if not ENABLE_ARGO:
+async def keepalive_loop():
+    if not AUTO_ACCESS:
         return
-    cf_bin = "/tmp/cloudflared_worker"
+    await asyncio.sleep(15)
+    ping_url = f"{PROJECT_URL}/health" if not PROJECT_URL.endswith("/") else f"{PROJECT_URL}health"
+    log(f"Keepalive watcher active -> {ping_url}")
+    while True:
+        try:
+            req = urllib.request.Request(ping_url, headers={"User-Agent": "ahoorapr-keepalive/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.getcode()
+                log(f"Keepalive ping status: {status}")
+        except Exception as e:
+            log(f"Keepalive ping tick: {e}")
+        await asyncio.sleep(240)
+
+async def telegram_notify():
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        return
+    text = (
+        f"Server Started:\n"
+        f"Domain: {SERVER_DOMAIN}\n"
+        f"Port: 443\n"
+        f"Path: {WS_PATH}\n"
+        f"UUID: {UUID_STR}"
+    )
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": text}).encode()
     try:
-        if not os.path.exists(cf_bin):
-            log("Fetching tunnel helper...")
-            dl_url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-            urllib.request.urlretrieve(dl_url, cf_bin)
-            os.chmod(cf_bin, 0o755)
-
-        proc = await asyncio.create_subprocess_exec(
-            cf_bin, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        domain = None
-        while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
-            txt = line.decode("utf-8", errors="ignore")
-            match = re.search(r"https://([a-zA-Z0-9-]+\.trycloudflare\.com)", txt)
-            if match:
-                domain = match.group(1)
-                log(f"Argo domain established: {domain}")
-                print_connection_details(domain)
-                break
+        req = urllib.request.Request(url, data=payload, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log("Telegram startup notification dispatched")
     except Exception as e:
-        log("Tunnel helper notice:", e)
+        log("Telegram notify notice:", e)
 
 async def main():
     server = await asyncio.start_server(handle_client, "0.0.0.0", PORT)
-    log(f"Listening on port {PORT}")
-    log(f"Path: {WS_PATH}")
-    log(f"UUID: {UUID_STR}")
-    print_connection_details()
+    print_server_summary()
 
-    asyncio.create_task(start_argo_tunnel())
+    asyncio.create_task(keepalive_loop())
+    asyncio.create_task(telegram_notify())
 
     async with server:
         await server.serve_forever()
