@@ -1,0 +1,15 @@
+{
+  "name": "ahoorapr",
+  "version": "1.0.0",
+  "description": "Lightweight WebSocket network proxy microservice for Infrlo PaaS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
