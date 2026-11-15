@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * ahoorapr — minimal WebSocket proxy for Infrlo PaaS.
+ * ahoorapr — minimal WebSocket tunnel for Infrlo PaaS.
  *
  * Architecture:
  *   Client TLS --> Platform edge (edge TLS termination)
@@ -161,7 +161,7 @@ process.on("SIGINT", shutdown);
 
 // --- Startup log ---
 console.log(
-  "[ahoorapr] Starting minimal WS proxy"
+  "[ahoorapr] Starting minimal WS tunnel"
 );
 console.log(
   "[ahoorapr] Listening on 0.0.0.0:" + PORT + " path=" + WS_PATH
